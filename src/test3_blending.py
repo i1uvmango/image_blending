@@ -1,6 +1,6 @@
 """
 ROI 영역에 eye 이미지를 Laplacian Pyramid 방식으로 합성
-- eye의 눈 윤곽만 blending 대상
+- 타원 마스크를 사용한 블렌딩
 - ROI 내부에서만 블렌딩, padding 없이 crop
 """
 
@@ -247,7 +247,11 @@ def upsample(image, target_shape):
 
 
 def build_laplacian_pyramid(gaussian_pyramid, sigma=1.0, kernel_size=None):
-    """Laplacian Pyramid 생성"""
+    """
+    Laplacian Pyramid 생성 (일반 구조)
+    LPI(L) = GPI(L) - upsample(GPI(L+1)) for L = 0 to levels-2
+    마지막 레벨은 포함하지 않음 (levels-1개만 생성)
+    """
     laplacian_pyramid = []
     
     for i in range(len(gaussian_pyramid) - 1):
@@ -264,9 +268,7 @@ def build_laplacian_pyramid(gaussian_pyramid, sigma=1.0, kernel_size=None):
         laplacian = current - upsampled_filtered
         laplacian_pyramid.append(laplacian)
     
-    # 마지막 레벨은 Gaussian의 마지막 레벨
-    laplacian_pyramid.append(gaussian_pyramid[-1].copy())
-    
+    # 마지막 레벨은 포함하지 않음 (일반 구조)
     return laplacian_pyramid
 
 
@@ -295,41 +297,46 @@ def visualize_laplacian_pyramid(pyramid, title, save_path=None):
 
 
 # ============================================================================
-# Step 5: Edge Mask 생성 (eye의 Laplacian 절댓값 기반)
+# Step 5: 타원 마스크 생성
 # ============================================================================
 
-def create_edge_mask_from_laplacian(laplacian_pyramid, sigma_blur=3.0):
+def create_ellipse_mask(roi_shape, center_ratio=(0.5, 0.5), size_ratio=(0.8, 0.8), sigma_blur=3.0):
     """
-    eye의 Laplacian 절댓값으로 edge mask 생성
+    ROI 영역에 타원 마스크 생성
     
     Args:
-        laplacian_pyramid: eye의 Laplacian pyramid
+        roi_shape: (height, width) ROI 크기
+        center_ratio: (y_ratio, x_ratio) 타원 중심 위치 비율 (0~1, 기본값: (0.5, 0.5) = 중심)
+        size_ratio: (y_ratio, x_ratio) 타원 크기 비율 (0~1, 기본값: (0.8, 0.8) = ROI의 80%)
         sigma_blur: Gaussian blur 표준편차
     
     Returns:
-        numpy array: 0~1 범위의 edge mask
+        numpy array: 0~1 범위의 타원 마스크
     """
-    # 각 레벨의 Laplacian 절댓값을 합산
-    edge_map = np.zeros_like(laplacian_pyramid[0])
+    h, w = roi_shape
+    center_y = int(h * center_ratio[0])
+    center_x = int(w * center_ratio[1])
     
-    for i, lap in enumerate(laplacian_pyramid[:-1]):  # 마지막 레벨 제외
-        # 절댓값
-        abs_lap = np.abs(lap)
-        # 원본 크기로 업샘플링
-        if i > 0:
-            abs_lap = upsample(abs_lap, edge_map.shape)
-        edge_map += abs_lap
+    # 타원 반지름 (ROI 크기의 비율로)
+    radius_y = int(h * size_ratio[0] / 2)
+    radius_x = int(w * size_ratio[1] / 2)
     
-    # 정규화
-    edge_map = (edge_map - edge_map.min()) / (edge_map.max() - edge_map.min() + 1e-10)
+    # 좌표 그리드 생성
+    y, x = np.ogrid[:h, :w]
+    
+    # 타원 방정식: ((x-cx)/rx)² + ((y-cy)/ry)² <= 1
+    ellipse_mask = ((x - center_x) / radius_x) ** 2 + ((y - center_y) / radius_y) ** 2 <= 1
+    
+    # float로 변환
+    ellipse_mask = ellipse_mask.astype(np.float64)
     
     # Gaussian blur로 부드럽게
-    edge_mask = gaussian_filter(edge_map, sigma=sigma_blur)
+    ellipse_mask = gaussian_filter(ellipse_mask, sigma=sigma_blur)
     
     # 0~1 범위로 정규화
-    edge_mask = (edge_mask - edge_mask.min()) / (edge_mask.max() - edge_mask.min() + 1e-10)
+    ellipse_mask = (ellipse_mask - ellipse_mask.min()) / (ellipse_mask.max() - ellipse_mask.min() + 1e-10)
     
-    return edge_mask
+    return ellipse_mask
 
 
 def create_mask_pyramid(mask, levels, sigma=1.0, kernel_size=None):
@@ -365,14 +372,10 @@ def visualize_mask(mask, title, save_path=None):
 # Step 6: Laplacian Pyramid Blending
 # ============================================================================
 
-def blend_laplacian_pyramids(laplacian_hand, laplacian_eye, mask_pyramid, mask_power=0.5, mask_min=0.3):
+def blend_laplacian_pyramids(laplacian_hand, laplacian_eye, mask_pyramid):
     """
     두 Laplacian Pyramid를 마스크로 블렌딩
     blended = eye * mask + hand * (1 - mask)
-    
-    Args:
-        mask_power: mask 값에 적용할 지수 (1보다 작으면 mask가 강화됨, 기본값: 0.5)
-        mask_min: mask의 최소값 (0~1, 기본값: 0.3)
     """
     blended_pyramid = []
     
@@ -389,16 +392,8 @@ def blend_laplacian_pyramids(laplacian_hand, laplacian_eye, mask_pyramid, mask_p
         lap_eye = lap_eye[:h_min, :w_min]
         mask = mask[:h_min, :w_min]
         
-        # Mask 강화: 눈이 더 불투명하게 보이도록
-        # 1. mask에 power 적용 (1보다 작으면 값이 커짐)
-        mask_enhanced = mask ** mask_power
-        # 2. 최소값 설정 (mask_min 이상으로 유지)
-        mask_enhanced = np.clip(mask_enhanced, mask_min, 1.0)
-        # 3. 정규화하여 0~1 범위 유지
-        mask_enhanced = (mask_enhanced - mask_enhanced.min()) / (mask_enhanced.max() - mask_enhanced.min() + 1e-10)
-        
         # 블렌딩: eye * mask + hand * (1 - mask)
-        blended = lap_eye * mask_enhanced + lap_hand * (1 - mask_enhanced)
+        blended = lap_eye * mask + lap_hand * (1 - mask)
         blended_pyramid.append(blended)
     
     return blended_pyramid
@@ -432,13 +427,26 @@ def visualize_blended_pyramid(pyramid, title, save_path=None):
 # Step 7: Pyramid Collapse (복원)
 # ============================================================================
 
-def collapse_laplacian_pyramid(laplacian_pyramid, sigma=1.0, kernel_size=None):
-    """Laplacian Pyramid를 복원하여 원본 이미지 재구성"""
-    # 마지막 레벨부터 시작
-    reconstructed = laplacian_pyramid[-1].copy()
+def collapse_laplacian_pyramid(laplacian_pyramid, gaussian_base, sigma=1.0, kernel_size=None, return_steps=False):
+    """
+    Laplacian Pyramid를 복원하여 원본 이미지 재구성 (일반 구조)
+    Gaussian의 마지막 레벨에서 시작하여 Laplacian을 더해감
     
-    # 역순으로 업샘플링하고 더하기
-    for i in range(len(laplacian_pyramid) - 2, -1, -1):
+    Args:
+        laplacian_pyramid: Laplacian Pyramid (levels-1개)
+        gaussian_base: Gaussian Pyramid의 마지막 레벨 (복원의 시작점)
+        return_steps: True이면 복원 과정의 각 단계를 리스트로 반환
+    
+    Returns:
+        reconstructed: 복원된 이미지
+        reconstruction_steps: return_steps=True일 때 각 단계의 이미지 리스트
+    """
+    # Gaussian의 마지막 레벨에서 시작 (일반 구조)
+    reconstructed = gaussian_base.copy()
+    reconstruction_steps = [reconstructed.copy()] if return_steps else None
+    
+    # 역순으로 업샘플링하고 Laplacian 더하기
+    for i in range(len(laplacian_pyramid) - 1, -1, -1):
         # 목표 크기
         target_shape = laplacian_pyramid[i].shape
         
@@ -450,7 +458,12 @@ def collapse_laplacian_pyramid(laplacian_pyramid, sigma=1.0, kernel_size=None):
         
         # Laplacian 더하기
         reconstructed = upsampled_filtered + laplacian_pyramid[i]
+        
+        if return_steps:
+            reconstruction_steps.append(reconstructed.copy())
     
+    if return_steps:
+        return reconstructed, reconstruction_steps
     return reconstructed
 
 
@@ -458,10 +471,11 @@ def collapse_laplacian_pyramid(laplacian_pyramid, sigma=1.0, kernel_size=None):
 # 메인 블렌딩 파이프라인
 # ============================================================================
 
-def roi_eye_blend(hand_path, eye_path, roi_coords, output_dir='test2', 
-                  levels=5, sigma=1.0, sigma_blur=3.0, mask_power=0.5, mask_min=0.3):
+def roi_eye_blend(hand_path, eye_path, roi_coords, output_dir='test3', 
+                  levels=5, sigma=1.0, sigma_blur=3.0,
+                  ellipse_center=(0.5, 0.5), ellipse_size=(0.8, 0.8)):
     """
-    hand 이미지의 ROI 영역에 eye 이미지를 Laplacian Pyramid로 블렌딩
+    hand 이미지의 ROI 영역에 eye 이미지를 Laplacian Pyramid로 블렌딩 (타원 마스크 사용)
     
     Args:
         hand_path: hand 이미지 경로
@@ -470,9 +484,9 @@ def roi_eye_blend(hand_path, eye_path, roi_coords, output_dir='test2',
         output_dir: 결과 저장 디렉토리
         levels: 피라미드 레벨 수
         sigma: Gaussian 표준편차
-        sigma_blur: Edge mask blur 표준편차
-        mask_power: mask 값에 적용할 지수 (1보다 작으면 mask가 강화되어 눈이 더 불투명, 기본값: 0.5)
-        mask_min: mask의 최소값 (0~1, 기본값: 0.3, 높을수록 눈이 더 불투명)
+        sigma_blur: 타원 마스크 blur 표준편차
+        ellipse_center: 타원 중심 위치 비율 (y_ratio, x_ratio)
+        ellipse_size: 타원 크기 비율 (y_ratio, x_ratio)
     """
     # 출력 디렉토리 생성
     os.makedirs(output_dir, exist_ok=True)
@@ -481,12 +495,13 @@ def roi_eye_blend(hand_path, eye_path, roi_coords, output_dir='test2',
     os.makedirs(os.path.join(output_dir, 'step2_gaussian_pyramid_eye'), exist_ok=True)
     os.makedirs(os.path.join(output_dir, 'step3_laplacian_pyramid_hand'), exist_ok=True)
     os.makedirs(os.path.join(output_dir, 'step3_laplacian_pyramid_eye'), exist_ok=True)
-    os.makedirs(os.path.join(output_dir, 'step4_edge_mask'), exist_ok=True)
+    os.makedirs(os.path.join(output_dir, 'step4_ellipse_mask'), exist_ok=True)
     os.makedirs(os.path.join(output_dir, 'step5_blended_laplacian'), exist_ok=True)
     os.makedirs(os.path.join(output_dir, 'step6_final'), exist_ok=True)
+    os.makedirs(os.path.join(output_dir, 'step7_pyramid_visualization'), exist_ok=True)
     
     print("=" * 60)
-    print("ROI 기반 Eye Blending 시작")
+    print("ROI 기반 Eye Blending 시작 (타원 마스크 사용)")
     print("=" * 60)
     
     # Step 1: 이미지 준비 및 ROI crop
@@ -561,30 +576,30 @@ def roi_eye_blend(hand_path, eye_path, roi_coords, output_dir='test2',
             os.path.join(output_dir, 'step3_laplacian_pyramid_eye', f'level_{i}.png')
         )
     
-    # Step 4: Edge Mask 생성 (eye의 Laplacian 절댓값 기반)
-    print("\n[Step 4] Edge Mask 생성 (eye Laplacian 절댓값 기반)")
-    edge_mask = create_edge_mask_from_laplacian(laplacian_eye_Y, sigma_blur)
-    mask_pyramid = create_mask_pyramid(edge_mask, levels, sigma)
+    # Step 4: 타원 마스크 생성
+    print("\n[Step 4] 타원 마스크 생성")
+    roi_h, roi_w = hand_Y_roi.shape
+    ellipse_mask = create_ellipse_mask((roi_h, roi_w), ellipse_center, ellipse_size, sigma_blur)
+    mask_pyramid = create_mask_pyramid(ellipse_mask, levels, sigma)
     
-    visualize_mask(edge_mask, "Edge Mask (from Eye Laplacian)", 
-                   os.path.join(output_dir, 'step4_edge_mask', 'edge_mask.png'))
+    visualize_mask(ellipse_mask, "Ellipse Mask", 
+                   os.path.join(output_dir, 'step4_ellipse_mask', 'ellipse_mask.png'))
     
     # Mask pyramid 시각화
-    visualize_gaussian_pyramid(mask_pyramid, "Edge Mask Pyramid",
-                              os.path.join(output_dir, 'step4_edge_mask', 'mask_pyramid.png'),
+    visualize_gaussian_pyramid(mask_pyramid, "Ellipse Mask Pyramid",
+                              os.path.join(output_dir, 'step4_ellipse_mask', 'mask_pyramid.png'),
                               is_mask=True)
     
     # 각 레벨 저장
     for i, level_mask in enumerate(mask_pyramid):
         mask_vis = (level_mask * 255).astype(np.uint8)
         Image.fromarray(mask_vis).save(
-            os.path.join(output_dir, 'step4_edge_mask', f'mask_level_{i}.png')
+            os.path.join(output_dir, 'step4_ellipse_mask', f'mask_level_{i}.png')
         )
     
     # Step 5: Laplacian Pyramid Blending
     print("\n[Step 5] Laplacian Pyramid Blending")
-    print(f"  Mask 강화 파라미터: power={mask_power}, min={mask_min}")
-    blended_laplacian_Y = blend_laplacian_pyramids(laplacian_hand_Y, laplacian_eye_Y, mask_pyramid, mask_power, mask_min)
+    blended_laplacian_Y = blend_laplacian_pyramids(laplacian_hand_Y, laplacian_eye_Y, mask_pyramid)
     
     visualize_blended_pyramid(blended_laplacian_Y, "Blended Laplacian Pyramid (Y)",
                               os.path.join(output_dir, 'step5_blended_laplacian', 'pyramid_Y.png'))
@@ -599,20 +614,142 @@ def roi_eye_blend(hand_path, eye_path, roi_coords, output_dir='test2',
     # U, V 채널도 같은 방식으로 블렌딩
     laplacian_hand_U = build_laplacian_pyramid(gaussian_hand_U, sigma)
     laplacian_eye_U = build_laplacian_pyramid(gaussian_eye_U, sigma)
-    blended_laplacian_U = blend_laplacian_pyramids(laplacian_hand_U, laplacian_eye_U, mask_pyramid, mask_power, mask_min)
+    blended_laplacian_U = blend_laplacian_pyramids(laplacian_hand_U, laplacian_eye_U, mask_pyramid)
     
     laplacian_hand_V = build_laplacian_pyramid(gaussian_hand_V, sigma)
     laplacian_eye_V = build_laplacian_pyramid(gaussian_eye_V, sigma)
-    blended_laplacian_V = blend_laplacian_pyramids(laplacian_hand_V, laplacian_eye_V, mask_pyramid, mask_power, mask_min)
+    blended_laplacian_V = blend_laplacian_pyramids(laplacian_hand_V, laplacian_eye_V, mask_pyramid)
     
     # Step 6: Pyramid Collapse (복원)
     print("\n[Step 6] Pyramid Collapse (복원)")
-    Y_blended_roi = collapse_laplacian_pyramid(blended_laplacian_Y, sigma)
-    U_blended_roi = collapse_laplacian_pyramid(blended_laplacian_U, sigma)
-    V_blended_roi = collapse_laplacian_pyramid(blended_laplacian_V, sigma)
+    # Gaussian의 마지막 레벨을 블렌딩 (일반 구조)
+    gaussian_hand_Y_last = gaussian_hand_Y[-1]
+    gaussian_eye_Y_last = gaussian_eye_Y[-1]
+    mask_last = mask_pyramid[-1]
+    
+    # 크기 맞추기
+    h_min = min(gaussian_hand_Y_last.shape[0], gaussian_eye_Y_last.shape[0], mask_last.shape[0])
+    w_min = min(gaussian_hand_Y_last.shape[1], gaussian_eye_Y_last.shape[1], mask_last.shape[1])
+    gaussian_hand_Y_last = gaussian_hand_Y_last[:h_min, :w_min]
+    gaussian_eye_Y_last = gaussian_eye_Y_last[:h_min, :w_min]
+    mask_last = mask_last[:h_min, :w_min]
+    
+    # 마지막 Gaussian 레벨 블렌딩
+    Y_gaussian_base = gaussian_eye_Y_last * mask_last + gaussian_hand_Y_last * (1 - mask_last)
+    
+    # U, V도 동일하게
+    gaussian_hand_U_last = gaussian_hand_U[-1][:h_min, :w_min]
+    gaussian_eye_U_last = gaussian_eye_U[-1][:h_min, :w_min]
+    U_gaussian_base = gaussian_eye_U_last * mask_last + gaussian_hand_U_last * (1 - mask_last)
+    
+    gaussian_hand_V_last = gaussian_hand_V[-1][:h_min, :w_min]
+    gaussian_eye_V_last = gaussian_eye_V[-1][:h_min, :w_min]
+    V_gaussian_base = gaussian_eye_V_last * mask_last + gaussian_hand_V_last * (1 - mask_last)
+    
+    # Laplacian Pyramid 복원 (일반 구조)
+    Y_blended_roi, Y_reconstruction_steps = collapse_laplacian_pyramid(blended_laplacian_Y, Y_gaussian_base, sigma, return_steps=True)
+    U_blended_roi = collapse_laplacian_pyramid(blended_laplacian_U, U_gaussian_base, sigma)
+    V_blended_roi = collapse_laplacian_pyramid(blended_laplacian_V, V_gaussian_base, sigma)
     
     # YUV → RGB 변환
     result_roi_rgb = yuv_to_rgb(Y_blended_roi, U_blended_roi, V_blended_roi)
+    
+    # Step 7: 종합 Pyramid 시각화 (Gaussian, Laplacian, Reconstruction)
+    print("\n[Step 7] 종합 Pyramid 시각화")
+    
+    # 블렌딩된 결과의 Gaussian Pyramid 생성
+    blended_gaussian_Y = build_gaussian_pyramid(Y_blended_roi, levels, sigma)
+    blended_gaussian_U = build_gaussian_pyramid(U_blended_roi, levels, sigma)
+    blended_gaussian_V = build_gaussian_pyramid(V_blended_roi, levels, sigma)
+    
+    # 블렌딩된 결과의 Laplacian Pyramid 생성 (일반 구조: levels-1개)
+    blended_laplacian_result_Y = build_laplacian_pyramid(blended_gaussian_Y, sigma)
+    
+    # 복원 과정을 RGB로 변환
+    reconstruction_steps_rgb = []
+    for i, step_Y in enumerate(Y_reconstruction_steps):
+        # U, V도 같은 레벨로 맞춤
+        step_U = blended_gaussian_U[min(i, len(blended_gaussian_U)-1)]
+        step_V = blended_gaussian_V[min(i, len(blended_gaussian_V)-1)]
+        
+        # 크기 맞추기
+        h_min = min(step_Y.shape[0], step_U.shape[0], step_V.shape[0])
+        w_min = min(step_Y.shape[1], step_U.shape[1], step_V.shape[1])
+        step_Y = step_Y[:h_min, :w_min]
+        step_U = step_U[:h_min, :w_min]
+        step_V = step_V[:h_min, :w_min]
+        
+        step_rgb = yuv_to_rgb(step_Y, step_U, step_V)
+        reconstruction_steps_rgb.append(step_rgb)
+    
+    # Gaussian Pyramid를 RGB로 변환
+    gaussian_pyramid_rgb = []
+    for i in range(len(blended_gaussian_Y)):
+        rgb_level = yuv_to_rgb(blended_gaussian_Y[i], blended_gaussian_U[i], blended_gaussian_V[i])
+        gaussian_pyramid_rgb.append(rgb_level)
+    
+    # Laplacian Pyramid 정규화 (시각화용)
+    laplacian_pyramid_vis = []
+    for i, level in enumerate(blended_laplacian_result_Y):
+        level_normalized = (level - level.min()) / (level.max() - level.min() + 1e-10) * 255
+        laplacian_pyramid_vis.append(level_normalized.astype(np.uint8))
+    
+    # 종합 시각화 생성 (3행: Gaussian, Laplacian, Reconstruction)
+    n_gaussian = len(blended_gaussian_Y)  # levels개
+    n_laplacian = len(blended_laplacian_result_Y)  # levels-1개
+    n_reconstruction = len(reconstruction_steps_rgb)  # levels개 (마지막 Gaussian + Laplacian들)
+    
+    # 최대 열 수는 Gaussian의 개수
+    n_cols = n_gaussian
+    fig = plt.figure(figsize=(4*n_cols, 12))
+    
+    # 상단 행: Gaussian Pyramid (블렌딩된 이미지) - levels개
+    for i in range(n_gaussian):
+        ax = plt.subplot(3, n_cols, i + 1)
+        ax.imshow(gaussian_pyramid_rgb[i].astype(np.uint8))
+        ax.set_title(f'Level {i}\n{gaussian_pyramid_rgb[i].shape[1]}x{gaussian_pyramid_rgb[i].shape[0]}', fontsize=10)
+        ax.axis('off')
+    
+    # 중간 행: Laplacian Pyramid (디테일 레이어) - levels-1개
+    for i in range(n_cols):
+        ax = plt.subplot(3, n_cols, n_cols + i + 1)
+        if i < n_laplacian:
+            ax.imshow(laplacian_pyramid_vis[i], cmap='gray')
+            ax.set_title(f'Level {i}\n{laplacian_pyramid_vis[i].shape[1]}x{laplacian_pyramid_vis[i].shape[0]}', fontsize=10)
+        else:
+            # 마지막 열은 비워둠 (Laplacian은 levels-1개만 있음)
+            ax.axis('off')
+            ax.set_title(f'Level {i}\n(no Laplacian)', fontsize=10, style='italic')
+        ax.axis('off')
+    
+    # 하단 행: Reconstruction (복원 과정) - levels개
+    # reconstruction_steps는 마지막 Gaussian에서 시작하여 Laplacian을 더해감
+    for i in range(n_cols):
+        ax = plt.subplot(3, n_cols, 2*n_cols + i + 1)
+        if i < n_reconstruction:
+            idx = n_reconstruction - 1 - i  # 역순 인덱스
+            ax.imshow(reconstruction_steps_rgb[idx].astype(np.uint8))
+            level_num = n_gaussian - 1 - i
+            if i == n_reconstruction - 1:
+                ax.set_title(f'Level {level_num}\n(final result!)', fontsize=10, fontweight='bold')
+            else:
+                ax.set_title(f'Level {level_num}\n{reconstruction_steps_rgb[idx].shape[1]}x{reconstruction_steps_rgb[idx].shape[0]}', fontsize=10)
+        else:
+            ax.axis('off')
+        ax.axis('off')
+    
+    # 행 제목
+    fig.text(0.5, 0.95, 'Gaussian Pyramid (Blended Image)', ha='center', fontsize=14, fontweight='bold')
+    fig.text(0.5, 0.64, 'Laplacian Pyramid (Detail Layers)', ha='center', fontsize=14, fontweight='bold')
+    fig.text(0.5, 0.32, 'Reconstructed Blended Image', ha='center', fontsize=14, fontweight='bold')
+    
+    plt.suptitle('Image Blending using Image Pyramids (General Structure)', fontsize=16, fontweight='bold', y=0.98)
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    
+    save_path = os.path.join(output_dir, 'step7_pyramid_visualization', 'pyramid_complete.png')
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f"저장: {save_path}")
+    plt.close()
     
     # Step 6: ROI 영역을 원본 hand에 삽입 (여러 방법 비교)
     print("\n[Step 6] ROI 영역을 원본 hand에 삽입 (여러 방법 비교)")
@@ -743,11 +880,11 @@ if __name__ == "__main__":
         hand_path=hand_path,
         eye_path=eye_path,
         roi_coords=roi_coords,
-        output_dir='test2',
+        output_dir='test3',
         levels=5,
         sigma=1.0,
         sigma_blur=3.0,
-        mask_power=0.5,  # mask 값에 0.5 제곱 적용 (값이 커짐)
-        mask_min=0.4     # mask 최소값 0.4 (눈이 더 불투명하게)
+        ellipse_center=(0.5, 0.5),  # ROI 중심
+        ellipse_size=(0.8, 0.8)      # ROI 크기의 80%
     )
 
